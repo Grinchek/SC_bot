@@ -1,0 +1,29 @@
+# Віртуальне середовище
+.venv/
+venv/
+ENV/
+env/
+
+# Кеші Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Лог-файли
+*.log
+
+# Секрети
+.env
+
+# Завантаження (тимчасові файли ботів)
+downloads/
+tmp/
+*.mp3
+*.webm
+
+# Системні файли IDE/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
