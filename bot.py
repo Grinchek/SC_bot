@@ -197,14 +197,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            bot_name = (await context.bot.get_me()).username
+            caption = f"Завантажено з допомогою @{bot_name}"
+            
             with audio_file.open("rb") as f:
                 await safe_send(
                     update.message.reply_audio,
                     audio=f,
                     title=title,
                     performer=uploader,
-                    caption=f"Завантажено з: {url}"
+                    caption=caption
                 )
+
         else:
             await safe_send(
                 update.message.reply_text,
