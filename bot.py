@@ -4,14 +4,14 @@ import re
 import tempfile
 import shutil
 import logging
-import signal
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import urllib.request
 
 from dotenv import load_dotenv
 from telegram import Update, ChatMember
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
 from yt_dlp import YoutubeDL
 
@@ -19,8 +19,13 @@ from yt_dlp import YoutubeDL
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@your_channel")  # можна @username або -100...
-SOUNDCLOUD_RE = re.compile(r"https?://(?:www\.)?soundcloud\.com/[^\s]+", re.IGNORECASE)
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@your_channel")  # '@username' або '-100...'
+
+# ✅ Підтримуємо повні та короткі домени SoundCloud
+SOUNDCLOUD_RE = re.compile(
+    r"https?://(?:www\.)?(?:soundcloud\.com|on\.soundcloud\.com|snd\.sc)/[^\s]+",
+    re.IGNORECASE
+)
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 USER_COOLDOWN_SEC = float(os.getenv("USER_COOLDOWN_SEC", "20"))
@@ -33,22 +38,41 @@ logging.basicConfig(
 )
 log = logging.getLogger("sc-bot")
 
-# Ліміт паралельних завантажень + антиспам по користувачу
 sema = asyncio.Semaphore(MAX_CONCURRENCY)
 last_request_ts: dict[int, float] = {}
 
-# -------------------- Utils --------------------
+# -------------------- URL helpers --------------------
+def _clean_sc_url(url: str) -> str:
+    """
+    Прибирає UTM-параметри для soundcloud-доменів, решту лишає без змін.
+    """
+    scheme, netloc, path, query, frag = urlsplit(url)
+    if netloc.endswith("soundcloud.com"):
+        q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)
+             if not k.lower().startswith("utm_")]
+        query = urlencode(q)
+    return urlunsplit((scheme, netloc, path, query, frag))
+
+def _resolve_short_sync(url: str) -> str:
+    """
+    Синхронно розгортає короткий URL (on.soundcloud.com/snd.sc) по HTTP-редиректу.
+    У разі помилки повертає вихідний URL.
+    """
+    try:
+        with urllib.request.urlopen(url) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
+# -------------------- Send with retries --------------------
 async def safe_send(func, *args, **kwargs):
-    """Надсилання з ретраями та обробкою лімітів Telegram."""
     delay = 1.0
-    for attempt in range(4):
+    for _ in range(4):
         try:
             return await func(*args, **kwargs)
         except RetryAfter as e:
-            log.warning("RetryAfter: sleeping for %.2fs", e.retry_after)
             await asyncio.sleep(float(e.retry_after) + 0.5)
-        except (TimedOut, NetworkError) as e:
-            log.warning("Network/Timeout on send (attempt %d): %s", attempt + 1, e)
+        except (TimedOut, NetworkError):
             await asyncio.sleep(delay)
             delay = min(delay * 2, 8)
     raise RuntimeError("Send failed after retries")
@@ -58,11 +82,6 @@ def _valid_required_channel(value: str) -> bool:
 
 # -------------------- Subscription check --------------------
 async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """
-    True, якщо користувач підписаний на REQUIRED_CHANNEL.
-    Для приватних каналів використовуйте numeric id -100xxxxxxxxxxxx.
-    Бот має бути адміном каналу.
-    """
     try:
         member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
         status = getattr(member, "status", None)
@@ -73,7 +92,7 @@ async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> boo
     except Forbidden as e:
         log.warning("[is_subscribed] Forbidden: %s", e.message)
         return False
-    except Exception as e:
+    except Exception:
         log.exception("[is_subscribed] Unexpected error")
         return False
 
@@ -90,8 +109,7 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = await is_subscribed(context, user.id)
     await safe_send(
         update.message.reply_text,
-        f"Підписка на {REQUIRED_CHANNEL}: {'✅ так' if ok else '❌ ні'}\n"
-        "Якщо ❌ — перевір, що бот адмін каналу та значення REQUIRED_CHANNEL коректне."
+        f"Підписка на {REQUIRED_CHANNEL}: {'✅ так' if ok else '❌ ні'}"
     )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,7 +124,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Пер-користувацький cooldown (антиспам)
+    # Пер-користувацький cooldown
     now = asyncio.get_event_loop().time()
     prev = last_request_ts.get(user.id, 0.0)
     if prev + USER_COOLDOWN_SEC > now:
@@ -122,7 +140,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    url = m.group(0)
+    # Нормалізація та розгортання коротких лінків
+    url = _clean_sc_url(m.group(0))
+    if "on.soundcloud.com/" in url or "snd.sc/" in url:
+        loop = asyncio.get_event_loop()
+        url = await loop.run_in_executor(None, _resolve_short_sync, url)
+        url = _clean_sc_url(url)  # ще раз на випадок UTM після редиректу
+
     await safe_send(update.message.reply_text, "⏳ Обробляю посилання…")
 
     tmpdir = Path(tempfile.mkdtemp(prefix="scdl_"))
@@ -152,9 +176,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     audio_file = p
                     break
 
-        # Обмежуємо паралельність важких задач
+        # Обмежуємо паралельність та додаємо таймаут
         async with sema:
-            # Таймаут на завантаження/конвертацію
             loop = asyncio.get_event_loop()
             await asyncio.wait_for(loop.run_in_executor(None, _download), timeout=DOWNLOAD_TIMEOUT_SEC)
 
@@ -189,18 +212,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     except asyncio.TimeoutError:
-        log.warning("Download timed out for %s", url)
         await safe_send(update.message.reply_text, "⏳ Перевищено час очікування завантаження. Спробуй пізніше.")
     except Exception:
-        log.exception("Process error")
+        logging.getLogger("sc-bot").exception("Process error")
         await safe_send(update.message.reply_text, "Виникла помилка 😕 Спробуй інший лінк пізніше.")
     finally:
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
-            log.warning("Failed to cleanup tmpdir %s", tmpdir)
+            logging.getLogger("sc-bot").warning("Failed to cleanup %s", tmpdir)
 
 # -------------------- App bootstrap --------------------
+def _valid_required_channel(value: str) -> bool:
+    return value.startswith("@") or value.startswith("-100")
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не заданий у .env")
@@ -213,7 +238,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("Bot is running. Press Ctrl+C to stop.")
-    # run_polling вже коректно обробляє Ctrl+C; дод. хендлери сигналів не обов'язкові на Windows
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":

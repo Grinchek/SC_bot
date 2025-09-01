@@ -4,6 +4,7 @@ venv/
 ENV/
 env/
 
+
 # Кеші Python
 __pycache__/
 *.pyc
@@ -18,6 +19,7 @@ __pycache__/
 
 # Завантаження (тимчасові файли ботів)
 downloads/
+instructions/
 tmp/
 *.mp3
 *.webm
