@@ -104,37 +104,46 @@ def _safe_title(info: dict, fallback: str = "Track") -> str:
 def _safe_artist(info: dict) -> str:
     return (info or {}).get("artist") or (info or {}).get("uploader") or (info or {}).get("creator") or ""
 
-def _download_soundcloud_url(url: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
-    """Завантажити конкретний SoundCloud-трек за URL."""
+def _download_soundcloud_search(query: str, tmpdir: Path) -> tuple[Optional[Path], Optional[dict]]:
+    """
+    Пошук першого релевантного треку на SoundCloud:
+    1) робимо scsearch1 без завантаження,
+    2) беремо нормальний webpage_url/permalink_url,
+    3) качаємо вже за цією URL.
+    """
     info = None
     audio_file: Optional[Path] = None
 
     def _run():
         nonlocal info, audio_file
-        ydl_opts = _common_ydl_opts(tmpdir)
-        ydl_opts["format"] = "bestaudio/best"
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-        audio_file = _pick_first_mp3(tmpdir)
+        # Крок 1: пошук без завантаження
+        probe_opts = _common_ydl_opts(tmpdir)
+        with YoutubeDL(probe_opts) as ydl:
+            res = ydl.extract_info(f"scsearch1:{query}", download=False)
+            if not res or "entries" not in res or not res["entries"]:
+                return
+            info = res["entries"][0] or {}
+            # Крок 2: дістаємо нормальну сторінкову URL
+            page_url = (
+                info.get("webpage_url")
+                or info.get("permalink_url")
+                or info.get("url")  # інколи вже правильна
+            )
+        if not page_url:
+            return
 
-    _run()
-    return audio_file, info
+        # Розгорнемо короткі on.soundcloud.com, якщо трапиться
+        if "on.soundcloud.com" in page_url or "snd.sc" in page_url:
+            page_url = _resolve_short_sync(page_url)
+        page_url = _clean_sc_url(page_url)
 
-def _download_soundcloud_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
-    """Пошук першого релевантного треку на SoundCloud і MP3-вивантаження."""
-    info = None
-    audio_file: Optional[Path] = None
-
-    def _run():
-        nonlocal info, audio_file
-        ydl_opts = _common_ydl_opts(tmpdir)
-        ydl_opts["format"] = "bestaudio/best"
-        with YoutubeDL(ydl_opts) as ydl:
-            res = ydl.extract_info(f"scsearch1:{query}", download=True)
-            if res and "entries" in res and res["entries"]:
-                info = res["entries"][0]
-            else:
-                info = res
+        # Крок 3: реальне завантаження по нормальній URL
+        dl_opts = _common_ydl_opts(tmpdir)
+        dl_opts["format"] = "bestaudio/best"
+        with YoutubeDL(dl_opts) as ydl2:
+            info2 = ydl2.extract_info(page_url, download=True)
+            if info2:
+                info.update(info2 if isinstance(info2, dict) else {})
         audio_file = _pick_first_mp3(tmpdir)
 
     _run()
