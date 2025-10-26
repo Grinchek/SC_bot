@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from yt_dlp import YoutubeDL
 
-# -------------------- Config & logging -----------
+# -------------------- Config & logging --------------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
