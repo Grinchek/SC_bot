@@ -4,8 +4,11 @@ import os
 import tempfile
 import shutil
 import logging
+import re
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+import urllib.request
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -34,7 +37,29 @@ log = logging.getLogger("music-bot")
 sema = asyncio.Semaphore(MAX_CONCURRENCY)
 last_request_ts: dict[int, float] = {}
 
-# ==================== Helpers ====================
+# ==================== URL helpers ====================
+SOUNDCLOUD_RE = re.compile(
+    r"https?://(?:www\.)?(?:soundcloud\.com|on\.soundcloud\.com|snd\.sc)/[^\s]+",
+    re.IGNORECASE
+)
+
+def _clean_sc_url(url: str) -> str:
+    """Прибрати UTM з soundcloud.com-посилань."""
+    scheme, netloc, path, query, frag = urlsplit(url)
+    if "soundcloud.com" in netloc:
+        q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if not k.lower().startswith("utm_")]
+        query = urlencode(q)
+    return urlunsplit((scheme, netloc, path, query, frag))
+
+def _resolve_short_sync(url: str) -> str:
+    """Розгорнути короткі on.soundcloud.com/snd.sc редиректи."""
+    try:
+        with urllib.request.urlopen(url) as resp:
+            return resp.geturl()
+    except Exception:
+        return url
+
+# ==================== Telegram helpers ====================
 async def safe_send(func, *args, **kwargs):
     """Send with simple retries to handle Telegram timeouts / rate limits."""
     delay = 1.0
@@ -51,19 +76,21 @@ async def safe_send(func, *args, **kwargs):
 def _valid_required_channel(value: str) -> bool:
     return value.startswith("@") or value.startswith("-100")
 
+# ==================== yt-dlp helpers ====================
 def _common_ydl_opts(tmpdir: Path) -> dict:
+    # Загальні опції; формат вкажемо при завантаженні
     return {
         "outtmpl": str(tmpdir / "%(title)s.%(ext)s"),
         "restrictfilenames": True,
-        "format": "bestaudio/best",
-        "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
-        ],
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "prefer_ffmpeg": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+        ],
         "writeinfojson": True,
-        "source_address": "0.0.0.0",
+        "http_headers": {"User-Agent": "Mozilla/5.0"},
     }
 
 def _pick_first_mp3(tmpdir: Path) -> Optional[Path]:
@@ -72,26 +99,43 @@ def _pick_first_mp3(tmpdir: Path) -> Optional[Path]:
     return None
 
 def _safe_title(info: dict, fallback: str = "Track") -> str:
-    return info.get("title") or fallback
+    return (info or {}).get("title") or fallback
 
 def _safe_artist(info: dict) -> str:
-    return info.get("artist") or info.get("uploader") or info.get("creator") or ""
+    return (info or {}).get("artist") or (info or {}).get("uploader") or (info or {}).get("creator") or ""
 
-def _download_youtube_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
-    """
-    Виконує пошук першого збігу на YouTube і завантажує аудіо як MP3.
-    """
+def _download_soundcloud_url(url: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
+    """Завантажити конкретний SoundCloud-трек за URL."""
     info = None
     audio_file: Optional[Path] = None
 
     def _run():
         nonlocal info, audio_file
         ydl_opts = _common_ydl_opts(tmpdir)
+        ydl_opts["format"] = "bestaudio/best"
         with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch1:{query} audio", download=True)
-            if info and "entries" in info and info["entries"]:
-                info = info["entries"][0]
-            audio_file = _pick_first_mp3(tmpdir)
+            info = ydl.extract_info(url, download=True)
+        audio_file = _pick_first_mp3(tmpdir)
+
+    _run()
+    return audio_file, info
+
+def _download_soundcloud_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
+    """Пошук першого релевантного треку на SoundCloud і MP3-вивантаження."""
+    info = None
+    audio_file: Optional[Path] = None
+
+    def _run():
+        nonlocal info, audio_file
+        ydl_opts = _common_ydl_opts(tmpdir)
+        ydl_opts["format"] = "bestaudio/best"
+        with YoutubeDL(ydl_opts) as ydl:
+            res = ydl.extract_info(f"scsearch1:{query}", download=True)
+            if res and "entries" in res and res["entries"]:
+                info = res["entries"][0]
+            else:
+                info = res
+        audio_file = _pick_first_mp3(tmpdir)
 
     _run()
     return audio_file, info
@@ -100,11 +144,11 @@ def _download_youtube_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Привіт! 👋\n"
-        "Надішли *назву пісні або виконавця* — я пришлю MP3 (пошук через YouTube).\n"
-        f"Щоб отримувати файли, підпишись на канал {REQUIRED_CHANNEL}.\n\n"
+        "• Надішли *посилання на SoundCloud* АБО *назву пісні/виконавця* — я пришлю MP3.\n"
+        f"• Щоб отримувати файли, підпишись на канал {REQUIRED_CHANNEL}.\n\n"
         "Приклади:\n"
-        "• Imagine Dragons Believer\n"
-        "• Arctic Monkeys Do I Wanna Know"
+        "1) https://soundcloud.com/artist/track\n"
+        "2) Monolink Return to Oz"
     )
     await safe_send(update.message.reply_text, msg, disable_web_page_preview=True)
 
@@ -128,11 +172,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.effective_user
     if not user:
-        return
-
-    # Лише пошук по назві — блокуємо посилання
-    if "http://" in text.lower() or "https://" in text.lower():
-        await safe_send(update.message.reply_text, "Надішли *назву треку без посилань*, будь ласка 🙏")
         return
 
     # Пер-користувацький cooldown
@@ -160,12 +199,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    query = text
-    await safe_send(update.message.reply_text, f"🔎 Шукаю: “{query}”…")
-    # У PTB v21 немає ChatAction.UPLOAD_AUDIO → використовуємо UPLOAD_DOCUMENT або TYPING
+    url_match = SOUNDCLOUD_RE.search(text)
+    if url_match:
+        url = url_match.group(0)
+        # Розгортання коротких лінків та чистка UTM
+        if "on.soundcloud.com" in url or "snd.sc" in url:
+            loop = asyncio.get_event_loop()
+            url = await loop.run_in_executor(None, _resolve_short_sync, url)
+        url = _clean_sc_url(url)
+        source_label = url
+        action_message = "⏳ Обробляю посилання SoundCloud…"
+        downloader = lambda tmp: _download_soundcloud_url(url, tmp)
+    else:
+        query = text
+        source_label = "SoundCloud (пошук)"
+        action_message = f"🔎 Шукаю на SoundCloud: “{query}”…"
+        downloader = lambda tmp: _download_soundcloud_search(query, tmp)
+
+    await safe_send(update.message.reply_text, action_message)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
 
-    tmpdir = Path(tempfile.mkdtemp(prefix="music_"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="sc_"))
     try:
         audio_file: Optional[Path] = None
         info: Optional[dict] = None
@@ -173,14 +227,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with sema:
             loop = asyncio.get_event_loop()
             audio_file, info = await asyncio.wait_for(
-                loop.run_in_executor(None, _download_youtube_search, query, tmpdir),
+                loop.run_in_executor(None, downloader, tmpdir),
                 timeout=DOWNLOAD_TIMEOUT_SEC
             )
 
         if not audio_file or not audio_file.exists():
             await safe_send(
                 update.message.reply_text,
-                "Не вдалось знайти/завантажити трек. Спробуй точнішу назву."
+                "Не вдалось знайти/завантажити трек на SoundCloud. Спробуй іншу назву або лінк."
             )
             return
 
@@ -188,15 +242,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if size_mb > MAX_FILE_MB:
             await safe_send(
                 update.message.reply_text,
-                f"Файл завеликий для відправки (>{int(MAX_FILE_MB)} МБ)."
+                f"Файл завеликий для відправки (>{int(MAX_FILE_MB)} МБ). Джерело: {source_label}"
             )
             return
 
-        title = _safe_title(info, fallback=query)
+        title = _safe_title(info, fallback=text if not url_match else "Track")
         performer = _safe_artist(info)
 
         bot_name = (await context.bot.get_me()).username
-        caption = f"Завантажено з: YouTube\nЗ допомогою @{bot_name}"
+        caption = f"Завантажено \nЗ допомогою @{bot_name}"
 
         with audio_file.open("rb") as f:
             await safe_send(
