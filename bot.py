@@ -1,18 +1,17 @@
+
 import asyncio
 import os
-import re
 import tempfile
 import shutil
 import logging
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
-import urllib.request
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
-from telegram import Update, ChatMember
+from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import BadRequest, Forbidden, RetryAfter, TimedOut, NetworkError
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from yt_dlp import YoutubeDL
 
 # -------------------- Config & logging --------------------
@@ -20,12 +19,6 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "@your_channel")  # '@username' або '-100...'
-
-# ✅ Підтримуємо повні та короткі домени SoundCloud
-SOUNDCLOUD_RE = re.compile(
-    r"https?://(?:www\.)?(?:soundcloud\.com|on\.soundcloud\.com|snd\.sc)/[^\s]+",
-    re.IGNORECASE
-)
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 USER_COOLDOWN_SEC = float(os.getenv("USER_COOLDOWN_SEC", "20"))
@@ -36,36 +29,14 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s :: %(message)s"
 )
-log = logging.getLogger("sc-bot")
+log = logging.getLogger("music-bot")
 
 sema = asyncio.Semaphore(MAX_CONCURRENCY)
 last_request_ts: dict[int, float] = {}
 
-# -------------------- URL helpers --------------------
-def _clean_sc_url(url: str) -> str:
-    """
-    Прибирає UTM-параметри для soundcloud-доменів, решту лишає без змін.
-    """
-    scheme, netloc, path, query, frag = urlsplit(url)
-    if netloc.endswith("soundcloud.com"):
-        q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True)
-             if not k.lower().startswith("utm_")]
-        query = urlencode(q)
-    return urlunsplit((scheme, netloc, path, query, frag))
-
-def _resolve_short_sync(url: str) -> str:
-    """
-    Синхронно розгортає короткий URL (on.soundcloud.com/snd.sc) по HTTP-редиректу.
-    У разі помилки повертає вихідний URL.
-    """
-    try:
-        with urllib.request.urlopen(url) as resp:
-            return resp.geturl()
-    except Exception:
-        return url
-
-# -------------------- Send with retries --------------------
+# -------------------- Helpers --------------------
 async def safe_send(func, *args, **kwargs):
+    """Send with simple retries to handle Telegram timeouts / rate limits."""
     delay = 1.0
     for _ in range(4):
         try:
@@ -80,33 +51,71 @@ async def safe_send(func, *args, **kwargs):
 def _valid_required_channel(value: str) -> bool:
     return value.startswith("@") or value.startswith("-100")
 
-# -------------------- Subscription check --------------------
-async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    try:
-        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        status = getattr(member, "status", None)
-        return status not in ("left", "kicked")
-    except BadRequest as e:
-        log.warning("[is_subscribed] BadRequest: %s", e.message)
-        return False
-    except Forbidden as e:
-        log.warning("[is_subscribed] Forbidden: %s", e.message)
-        return False
-    except Exception:
-        log.exception("[is_subscribed] Unexpected error")
-        return False
+def _common_ydl_opts(tmpdir: Path) -> dict:
+    return {
+        "outtmpl": str(tmpdir / "%(title)s.%(ext)s"),
+        "restrictfilenames": True,
+        "format": "bestaudio/best",
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
+        ],
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "writeinfojson": True,
+        "source_address": "0.0.0.0",
+    }
+
+def _pick_first_mp3(tmpdir: Path) -> Optional[Path]:
+    for p in tmpdir.glob("*.mp3"):
+        return p
+    return None
+
+def _safe_title(info: dict, fallback: str = "Track") -> str:
+    return info.get("title") or fallback
+
+def _safe_artist(info: dict) -> str:
+    return info.get("artist") or info.get("uploader") or info.get("creator") or ""
+
+def _download_youtube_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
+    """
+    Виконує пошук першого збігу на YouTube і завантажує аудіо як MP3.
+    """
+    info = None
+    audio_file: Optional[Path] = None
+
+    def _run():
+        nonlocal info, audio_file
+        ydl_opts = _common_ydl_opts(tmpdir)
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch1:{query} audio", download=True)
+            if info and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+            audio_file = _pick_first_mp3(tmpdir)
+
+    _run()
+    return audio_file, info
 
 # -------------------- Handlers --------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_send(
-        update.message.reply_text,
-        "Надішли посилання на трек SoundCloud.\n"
-        f"Щоб отримати файл — підпишись на канал {REQUIRED_CHANNEL}."
+    msg = (
+        "Привіт! 👋\n"
+        "Надішли *назву пісні або виконавця* — я пришлю MP3 (пошук через YouTube).\n"
+        f"Щоб отримувати файли, підпишись на канал {REQUIRED_CHANNEL}.\n\n"
+        "Приклади:\n"
+        "• Imagine Dragons Believer\n"
+        "• Arctic Monkeys Do I Wanna Know"
     )
+    await safe_send(update.message.reply_text, msg, disable_web_page_preview=True)
 
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ok = await is_subscribed(context, user.id)
+    try:
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user.id)
+        status = getattr(member, "status", None)
+        ok = status not in ("left", "kicked")
+    except Exception:
+        ok = False
     await safe_send(
         update.message.reply_text,
         f"Підписка на {REQUIRED_CHANNEL}: {'✅ так' if ok else '❌ ні'}"
@@ -116,12 +125,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    m = SOUNDCLOUD_RE.search(update.message.text)
-    if not m:
-        return
-
+    text = update.message.text.strip()
     user = update.effective_user
     if not user:
+        return
+
+    # Забороняємо посилання — лише пошук по назві
+    if "http://" in text.lower() or "https://" in text.lower():
+        await safe_send(update.message.reply_text, "Надішли *назву треку без посилань*, будь ласка 🙏")
         return
 
     # Пер-користувацький cooldown
@@ -133,99 +144,80 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_request_ts[user.id] = now
 
     # Перевірка підписки
-    if not await is_subscribed(context, user.id):
+    try:
+        member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user.id)
+        status = getattr(member, "status", None)
+        if status in ("left", "kicked"):
+            await safe_send(
+                update.message.reply_text,
+                f"Спершу підпишись на канал {REQUIRED_CHANNEL}, а потім повтори запит 🙌"
+            )
+            return
+    except Exception:
         await safe_send(
             update.message.reply_text,
-            f"Спершу підпишись на канал {REQUIRED_CHANNEL}, а потім повтори запит 🙌"
+            f"Перевір невалідний канал {REQUIRED_CHANNEL} або дозволь мені бачити підписників."
         )
         return
 
-    # Нормалізація та розгортання коротких лінків
-    url = _clean_sc_url(m.group(0))
-    if "on.soundcloud.com/" in url or "snd.sc/" in url:
-        loop = asyncio.get_event_loop()
-        url = await loop.run_in_executor(None, _resolve_short_sync, url)
-        url = _clean_sc_url(url)  # ще раз на випадок UTM після редиректу
+    query = text
+    await safe_send(update.message.reply_text, f"🔎 Шукаю: “{query}”…")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
 
-    await safe_send(update.message.reply_text, "⏳ Обробляю посилання…")
-
-    tmpdir = Path(tempfile.mkdtemp(prefix="scdl_"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="music_"))
     try:
-        ydl_opts = {
-            "outtmpl": str(tmpdir / "%(title)s.%(ext)s"),
-            "restrictfilenames": True,
-            "format": "bestaudio/best",
-            "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}
-            ],
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "writeinfojson": True,
-            "source_address": "0.0.0.0",
-        }
-
-        info = None
         audio_file: Optional[Path] = None
+        info: Optional[dict] = None
 
-        def _download():
-            nonlocal info, audio_file
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                for p in tmpdir.glob("*.mp3"):
-                    audio_file = p
-                    break
-
-        # Обмежуємо паралельність та додаємо таймаут
         async with sema:
             loop = asyncio.get_event_loop()
-            await asyncio.wait_for(loop.run_in_executor(None, _download), timeout=DOWNLOAD_TIMEOUT_SEC)
+            audio_file, info = await asyncio.wait_for(
+                loop.run_in_executor(None, _download_youtube_search, query, tmpdir),
+                timeout=DOWNLOAD_TIMEOUT_SEC
+            )
 
-        if not info:
-            await safe_send(update.message.reply_text, "Не вдалося отримати інформацію про трек.")
-            return
-
-        title = info.get("title") or "SoundCloud Track"
-        uploader = info.get("uploader") or info.get("creator") or ""
-
-        if audio_file and audio_file.exists():
-            size_mb = audio_file.stat().st_size / (1024 * 1024)
-            if size_mb > MAX_FILE_MB:
-                await safe_send(
-                    update.message.reply_text,
-                    f"Файл завеликий для відправки (>{int(MAX_FILE_MB)} МБ). Ось посилання:\n{url}"
-                )
-                return
-
-            with audio_file.open("rb") as f:
-                await safe_send(
-                    update.message.reply_audio,
-                    audio=f,
-                    title=title,
-                    performer=uploader,
-                    caption=f"Завантажено з: {url}"
-                )
-        else:
+        if not audio_file or not audio_file.exists():
             await safe_send(
                 update.message.reply_text,
-                f"Не вдалось сформувати MP3 для цього треку.\n{url}"
+                "Не вдалось знайти/завантажити трек. Спробуй точнішу назву."
+            )
+            return
+
+        size_mb = audio_file.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_FILE_MB:
+            await safe_send(
+                update.message.reply_text,
+                f"Файл завеликий для відправки (>{int(MAX_FILE_MB)} МБ)."
+            )
+            return
+
+        title = _safe_title(info, fallback=query)
+        performer = _safe_artist(info)
+
+        bot_name = (await context.bot.get_me()).username
+        caption = f"Завантажено з: YouTube\nЗ допомогою @{bot_name}"
+
+        with audio_file.open("rb") as f:
+            await safe_send(
+                update.message.reply_audio,
+                audio=f,
+                title=title,
+                performer=performer,
+                caption=caption
             )
 
     except asyncio.TimeoutError:
         await safe_send(update.message.reply_text, "⏳ Перевищено час очікування завантаження. Спробуй пізніше.")
     except Exception:
-        logging.getLogger("sc-bot").exception("Process error")
-        await safe_send(update.message.reply_text, "Виникла помилка 😕 Спробуй інший лінк пізніше.")
+        log.exception("Process error")
+        await safe_send(update.message.reply_text, "Виникла помилка 😕 Спробуй інший запит трохи згодом.")
     finally:
         try:
             shutil.rmtree(tmpdir, ignore_errors=True)
         except Exception:
-            logging.getLogger("sc-bot").warning("Failed to cleanup %s", tmpdir)
+            log.warning("Failed to cleanup %s", tmpdir)
 
 # -------------------- App bootstrap --------------------
-def _valid_required_channel(value: str) -> bool:
-    return value.startswith("@") or value.startswith("-100")
-
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не заданий у .env")
