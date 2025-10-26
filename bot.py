@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.error import RetryAfter, TimedOut, NetworkError
 from yt_dlp import YoutubeDL
 
-# -------------------- Config & logging --------------------
+# ==================== Config & logging ====================
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -34,7 +34,7 @@ log = logging.getLogger("music-bot")
 sema = asyncio.Semaphore(MAX_CONCURRENCY)
 last_request_ts: dict[int, float] = {}
 
-# -------------------- Helpers --------------------
+# ==================== Helpers ====================
 async def safe_send(func, *args, **kwargs):
     """Send with simple retries to handle Telegram timeouts / rate limits."""
     delay = 1.0
@@ -96,7 +96,7 @@ def _download_youtube_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], 
     _run()
     return audio_file, info
 
-# -------------------- Handlers --------------------
+# ==================== Handlers ====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "Привіт! 👋\n"
@@ -130,7 +130,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Забороняємо посилання — лише пошук по назві
+    # Лише пошук по назві — блокуємо посилання
     if "http://" in text.lower() or "https://" in text.lower():
         await safe_send(update.message.reply_text, "Надішли *назву треку без посилань*, будь ласка 🙏")
         return
@@ -156,13 +156,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await safe_send(
             update.message.reply_text,
-            f"Перевір невалідний канал {REQUIRED_CHANNEL} або дозволь мені бачити підписників."
+            f"Перевір налаштування каналу {REQUIRED_CHANNEL} або дозволь мені бачити підписників."
         )
         return
 
     query = text
     await safe_send(update.message.reply_text, f"🔎 Шукаю: “{query}”…")
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_AUDIO)
+    # У PTB v21 немає ChatAction.UPLOAD_AUDIO → використовуємо UPLOAD_DOCUMENT або TYPING
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
 
     tmpdir = Path(tempfile.mkdtemp(prefix="music_"))
     try:
@@ -217,7 +218,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.warning("Failed to cleanup %s", tmpdir)
 
-# -------------------- App bootstrap --------------------
+# ==================== Error handler ====================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    err = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    logging.error("Unhandled error:\n%s", err)
+
+# ==================== App bootstrap ====================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не заданий у .env")
@@ -228,6 +235,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     log.info("Bot is running. Press Ctrl+C to stop.")
     app.run_polling(close_loop=False)
