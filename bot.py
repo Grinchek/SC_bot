@@ -1,4 +1,3 @@
-
 import asyncio
 import os
 import tempfile
@@ -104,11 +103,56 @@ def _safe_title(info: dict, fallback: str = "Track") -> str:
 def _safe_artist(info: dict) -> str:
     return (info or {}).get("artist") or (info or {}).get("uploader") or (info or {}).get("creator") or ""
 
-def _download_soundcloud_search(query: str, tmpdir: Path) -> tuple[Optional[Path], Optional[dict]]:
+def _download_soundcloud_url(url: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
+    """
+    Завантаження треку за URL:
+    - розгортає короткі on.soundcloud.com/snd.sc
+    - чистить utm
+    - якщо дано api.soundcloud.com, спочатку витягає webpage_url/permalink_url
+    - качає bestaudio → mp3
+    """
+    info = None
+    audio_file: Optional[Path] = None
+
+    # нормалізація посилання
+    if "on.soundcloud.com" in url or "snd.sc" in url:
+        url = _resolve_short_sync(url)
+    url = _clean_sc_url(url)
+
+    def _run():
+        nonlocal info, audio_file, url
+
+        # 1) Проба без завантаження — дістанемо нормальну сторінкову URL
+        probe_opts = _common_ydl_opts(tmpdir)
+        with YoutubeDL(probe_opts) as ydl:
+            try:
+                probe = ydl.extract_info(url, download=False)
+            except Exception:
+                probe = None
+
+        page_url = (
+            (probe or {}).get("webpage_url")
+            or (probe or {}).get("permalink_url")
+            or url
+        )
+
+        # 2) Реальне завантаження по сторінковій URL
+        dl_opts = _common_ydl_opts(tmpdir)
+        dl_opts["format"] = "bestaudio/best"
+        with YoutubeDL(dl_opts) as ydl2:
+            info = ydl2.extract_info(page_url, download=True)
+
+        # 3) Знайдемо mp3, який створив постпроцесор
+        audio_file = _pick_first_mp3(tmpdir)
+
+    _run()
+    return audio_file, info
+
+def _download_soundcloud_search(query: str, tmpdir: Path) -> Tuple[Optional[Path], Optional[dict]]:
     """
     Пошук першого релевантного треку на SoundCloud:
     1) робимо scsearch1 без завантаження,
-    2) беремо нормальний webpage_url/permalink_url,
+    2) беремо webpage_url/permalink_url,
     3) качаємо вже за цією URL.
     """
     info = None
@@ -183,7 +227,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Пер-користувацький ###### cooldown
+    # Пер-користувацький cooldown
     now = asyncio.get_event_loop().time()
     prev = last_request_ts.get(user.id, 0.0)
     if prev + USER_COOLDOWN_SEC > now:
@@ -259,7 +303,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         performer = _safe_artist(info)
 
         bot_name = (await context.bot.get_me()).username
-        caption = f"Завантажено \nЗ допомогою @{bot_name}"
+        caption = f"Завантажено з: {source_label}\nЗ допомогою @{bot_name}"
 
         with audio_file.open("rb") as f:
             await safe_send(
