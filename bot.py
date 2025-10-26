@@ -174,7 +174,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         return
 
-    # Пер-користувацький cooldown
+    # Пер-користувацький ###### cooldown
     now = asyncio.get_event_loop().time()
     prev = last_request_ts.get(user.id, 0.0)
     if prev + USER_COOLDOWN_SEC > now:
